@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zx-cenf"
+version = "0.1.0"
+description = "ZX-CENF rewrite simplifier"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx",
+    "pyzx",
+    "numpy",
+    "pandas",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

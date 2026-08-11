@@ -1,0 +1,12 @@
+data/toy/*.qasm
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.ipynb_checkpoints/

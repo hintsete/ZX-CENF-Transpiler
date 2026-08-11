@@ -1,0 +1,4 @@
+pyzx==0.10.4
+networkx
+numpy
+tqdm
