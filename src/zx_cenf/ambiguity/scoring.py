@@ -1,5 +1,5 @@
 """Ambiguity scoring on PyZX simplification: extracts a circuit after each
-randomized-order run and compares gate count / T-count / depth, """
+randomized-order run and compares gate count / T-count / depth/ TwoQubit count """
 
 from __future__ import annotations
 

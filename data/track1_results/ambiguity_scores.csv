@@ -1,0 +1,4 @@
+diagram_id,input_spiders,input_edges,n_orderings,n_successful_extractions,twoqubitcount_ambiguity_score,twoqubitcount_is_ambiguous,tcount_ambiguity_score,depth_ambiguity_score,full_reduce_twoqubitcount,full_reduce_tcount,full_reduce_depth,headroom_vs_full_reduce_twoqubitcount,headroom_vs_full_reduce_tcount,n_ambiguous_spiders,pct_ambiguous_spiders,control_min_spiders,control_max_spiders,control_ambiguity_score,control_is_ambiguous
+toy_larger_clifford_heavy,91,107,30,13,0.5683060109289617,True,0.0,0.31567328918322296,32,6,40,0.375,0.0,30,33.0,63,63,0.0,False
+toy_medium_diverse,66,80,30,7,0.1337579617834395,True,0.0,0.06698564593301436,22,5,29,0.045454545454545456,0.0,23,34.8,49,49,0.0,False
+toy_small_dense,42,50,30,13,0.47150259067357514,True,0.3466666666666667,0.5168195718654435,14,5,21,0.21428571428571427,0.0,15,35.7,32,32,0.0,False
