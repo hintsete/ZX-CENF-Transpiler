@@ -1,0 +1,15 @@
+cluster,circuit_name,n_spiders,dominant_outcome,dominant_spider_type,mean_survival_rate,mean_bernoulli_ambiguity
+-1,toy_larger_clifford_heavy,45,dead,Z,0.0,0.0
+0,toy_larger_clifford_heavy,4,dead,X,0.1417,0.4256
+1,toy_larger_clifford_heavy,42,dead,Z,0.4651,0.4646
+-2,toy_medium_diverse,1,rare,Z,1.0,0.0
+-1,toy_medium_diverse,24,dead,Z,0.0,0.0
+0,toy_medium_diverse,40,dead,Z,0.4642,0.4477
+1,toy_medium_diverse,1,dead,Z,0.0667,0.2489
+-1,toy_small_dense,14,dead,X,0.0,0.0
+0,toy_small_dense,2,dead,Z,0.1333,0.4222
+1,toy_small_dense,3,dead,Z,0.3,0.5911
+2,toy_small_dense,4,dead,Z,0.3,0.18
+3,toy_small_dense,3,rare,Z,0.5333,0.4356
+4,toy_small_dense,15,dead,Z,0.6044,0.5932
+5,toy_small_dense,1,rare,X,1.0,0.0

@@ -13,10 +13,12 @@ dependencies = [
     "numpy",
     "pandas",
     "tqdm",
+    "scipy>=1.11.0",
+    "scikit-learn>=1.4.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "hypothesis>=6.100.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

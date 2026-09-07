@@ -3,7 +3,8 @@ randomized-order run and compares gate count / T-count / depth/ TwoQubit count "
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
 import pyzx as zx
 
@@ -124,16 +125,55 @@ def _extract_and_measure(g, seed: int, pass_counts: dict) -> OrderingRunResult:
         )
 
 
+def build_ambiguity_result(
+    g_original,
+    diagram_id: str,
+    run_data: list[tuple[int, Any, dict]],
+    baseline_result: OrderingRunResult,
+) -> AmbiguityResult:
+    """Build an AmbiguityResult from pre-computed (seed, g_r, pass_counts) tuples.
+
+    Parameters
+    ----------
+    g_original :
+        The original ZX graph before any rewrites (unused here but kept for
+        API symmetry with build_spider_tags and the EvolutionaryTracker).
+    diagram_id : str
+        Identifier for this diagram, stored in the returned AmbiguityResult.
+    run_data : list of (seed, g_r, pass_counts)
+        The R rewrite runs already executed by the caller.  Each tuple contains
+        the integer seed used, the simplified graph G_r, and the pass-count
+        mapping returned by run_randomized_pass_order.
+    baseline_result : OrderingRunResult
+        The full_reduce baseline, pre-computed by the caller.
+
+    Returns
+    -------
+    AmbiguityResult
+    """
+    runs = [
+        _extract_and_measure(g_r, seed, pass_counts)
+        for seed, g_r, pass_counts in run_data
+    ]
+    return AmbiguityResult(diagram_id, runs, baseline_result)
+
+
 def score_diagram(g, diagram_id: str, n_orderings: int = 30, base_seed: int = 0) -> AmbiguityResult:
-    runs = []
+    """Score a diagram by running n_orderings randomized pass orderings.
+
+    This is the original public entry point, preserved for backward
+    compatibility.  It internally builds the run_data list and delegates to
+    build_ambiguity_result().
+    """
+    run_data: list[tuple[int, Any, dict]] = []
     for i in range(n_orderings):
         seed = base_seed + i
         g_copy = g.copy()
         pass_counts = run_randomized_pass_order(g_copy, seed=seed)
-        runs.append(_extract_and_measure(g_copy, seed, pass_counts))
+        run_data.append((seed, g_copy, pass_counts))
 
     g_baseline = g.copy()
     run_full_reduce_baseline(g_baseline)
     baseline_result = _extract_and_measure(g_baseline, seed=-1, pass_counts={})
 
-    return AmbiguityResult(diagram_id, runs, baseline_result)
+    return build_ambiguity_result(g, diagram_id, run_data, baseline_result)
