@@ -16,6 +16,7 @@ from zx_cenf.ambiguity.tagging import build_spider_tags
 from zx_cenf.ambiguity.evolutionary import EvolutionaryTracker
 from zx_cenf.ambiguity.pyzx_ordering import run_randomized_pass_order, run_full_reduce_baseline
 from zx_cenf.ingestion.loader import load_qasm_to_multigraph
+from zx_cenf.quantale.pareto import collect_diagram_valuations, summarize_diagram
 
 
 def run_track1(
@@ -25,6 +26,7 @@ def run_track1(
     n_orderings: int = 30,
     evolutionary_features_csv: Path | None = None,
     run_neighborhoods_csv: Path | None = None,
+    pareto_summary_csv: Path | None = None,
 ) -> None:
 
     base_seed = 0
@@ -37,6 +39,7 @@ def run_track1(
     all_spider_tags = []
     all_evo_features: list = []
     all_nbhd_records: list = []
+    all_pareto_rows: list = []
 
     for path in tqdm(qasm_paths, desc="Track 1: ambiguity scoring"):
         diagram_id = path.stem
@@ -51,6 +54,8 @@ def run_track1(
             g_copy = g.copy()
             pass_counts = run_randomized_pass_order(g_copy, seed=seed)
             run_data.append((seed, g_copy, pass_counts))
+        
+        
 
         # Baseline (full_reduce)
         g_baseline = g.copy()
@@ -61,6 +66,9 @@ def run_track1(
         result = build_ambiguity_result(g, diagram_id, run_data, baseline_result)
         spider_tags = build_spider_tags(g, diagram_id, [(s, gr) for s, gr, _ in run_data])
         all_spider_tags.extend(spider_tags)
+        if pareto_summary_csv is not None:
+            dv = collect_diagram_valuations(diagram_id, run_data)
+            all_pareto_rows.append(summarize_diagram(dv))
 
         # ── Evolutionary tracking (only when requested) ──────────────────────
         if evolutionary_features_csv is not None or run_neighborhoods_csv is not None:
@@ -70,6 +78,13 @@ def run_track1(
             features, nbhd_records = tracker.aggregate()
             all_evo_features.extend(features)
             all_nbhd_records.extend(nbhd_records)
+
+        if pareto_summary_csv is not None and all_pareto_rows:
+            pareto_summary_csv.parent.mkdir(parents=True, exist_ok=True)
+            with pareto_summary_csv.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=all_pareto_rows[0].keys())
+                writer.writeheader()
+                writer.writerows(all_pareto_rows)
 
         nx_graph = load_qasm_to_multigraph(str(path))
         control = score_control(nx_graph, diagram_id, n_orderings=n_orderings)

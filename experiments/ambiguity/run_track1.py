@@ -11,6 +11,7 @@ OUTPUT_CSV = _ROOT / "data" / "track1_results" / "ambiguity_scores.csv"
 SPIDER_TAGS_CSV = _ROOT / "data" / "track1_results" / "spider_ambiguity_tags.csv"
 EVO_FEATURES_CSV = _ROOT / "data" / "track1_results" / "spider_evolutionary_features.csv"
 RUN_NBHD_CSV = _ROOT / "data" / "track1_results" / "spider_run_neighborhoods.csv"
+PARETO_CSV = _ROOT / "data" / "track1_results" / "pareto_summary.csv"
 
 if __name__ == "__main__":
     qasm_paths = sorted(DATA_DIR.glob("*.qasm"))
@@ -22,8 +23,10 @@ if __name__ == "__main__":
         n_orderings=30,
         evolutionary_features_csv=EVO_FEATURES_CSV,
         run_neighborhoods_csv=RUN_NBHD_CSV,
+        pareto_summary_csv=PARETO_CSV,
     )
     print(f"Wrote diagram-level results for {n} diagrams to {OUTPUT_CSV}")
     print(f"Wrote spider-level ambiguity tags to {SPIDER_TAGS_CSV}")
     print(f"Wrote {n} circuits to {EVO_FEATURES_CSV}")
     print(f"Wrote {n} circuits to {RUN_NBHD_CSV}")
+    print(f"Wrote Pareto/correlation summary to {PARETO_CSV}")
