@@ -11,3 +11,5 @@ build/
 .env
 .ipynb_checkpoints/
 data/track1_results/
+phase_f_result.txt
+data/track3_results/
