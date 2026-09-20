@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from enum import Enum
 
 import pyzx.simplify as simp
 
-from zx_cenf.quantale.pattern_hash import compute_local_pattern_hash
+from zx_cenf.quantale.pattern_hash import (
+    compute_graph_state_hash,
+    compute_local_pattern_hash,
+)
 from zx_cenf.quantale.valuation import mu_from_pyzx_graph
 
 
@@ -20,6 +24,8 @@ INSTRUMENTABLE_RULES = {
     "id_removal": simp.id_simp,
 }
 
+DEFAULT_CONTEXT_REPRESENTATION = "NO_DEGREE"
+
 
 @dataclass
 class RewriteLogRow:
@@ -31,6 +37,26 @@ class RewriteLogRow:
     mu_after: tuple | None = None
     mu_valid: bool = True
     context_hash_variants: dict | None = None
+    selected_on_exploration_path: bool = True
+    reward_source: str = "terminal_greedy_rollout"
+    source_id: str | None = None
+
+
+class TrainingStopReason(str, Enum):
+    STRUCTURAL_FIXED_POINT = "structural_fixed_point"
+    CYCLE_DETECTED = "cycle_detected"
+    HIT_STEP_CAP = "hit_step_cap"
+    ALL_CANDIDATES_FAILED = "all_candidates_failed"
+
+
+@dataclass(frozen=True)
+class TrainingOutcome:
+    stop_reason: TrainingStopReason
+    n_steps: int
+
+    @property
+    def reached_fixed_point(self) -> bool:
+        return self.stop_reason == TrainingStopReason.STRUCTURAL_FIXED_POINT
 
 
 def enumerate_all_candidates(g) -> list:
@@ -59,49 +85,44 @@ def local_competing_rules(
     candidates,
     chosen,
 ) -> tuple:
-    _chosen_rule, chosen_match = chosen
-
-    chosen_vs = set(
-        match_vertices(chosen_match)
-    )
-
-    rules = set()
-
-    for rule_name, match in candidates:
-        candidate_vs = set(
-            match_vertices(match)
+    return tuple(
+        sorted(
+            {
+                rule_name
+                for rule_name, _match in competing_candidates(candidates, chosen)
+            }
         )
-
-        if chosen_vs & candidate_vs:
-            rules.add(rule_name)
-
-    return tuple(sorted(rules))
+    )
 
 
 def competing_candidates(
     candidates,
     chosen,
 ) -> list:
-    _chosen_rule, chosen_match = chosen
+    """Return the overlap-connected redex component containing ``chosen``.
 
-    chosen_vs = set(
-        match_vertices(chosen_match)
-    )
+    Using the full component makes the context independent of which member of
+    the same local crossroad happened to be selected first.
+    """
+    local_candidates = [chosen]
+    local_indices = set()
+    frontier_vertices = set(match_vertices(chosen[1]))
 
-    local_candidates = []
-
-    for rule_name, match in candidates:
-        candidate_vs = set(
-            match_vertices(match)
-        )
-
-        if chosen_vs & candidate_vs:
-            local_candidates.append(
-                (
-                    rule_name,
-                    match,
-                )
-            )
+    changed = True
+    while changed:
+        changed = False
+        for index, candidate in enumerate(candidates):
+            if index in local_indices:
+                continue
+            candidate_vertices = set(match_vertices(candidate[1]))
+            if frontier_vertices & candidate_vertices:
+                local_indices.add(index)
+                if candidate not in local_candidates:
+                    local_candidates.append(candidate)
+                new_vertices = candidate_vertices - frontier_vertices
+                if new_vertices:
+                    frontier_vertices.update(new_vertices)
+                    changed = True
 
     return local_candidates
 
@@ -304,22 +325,27 @@ def apply_match(
     g,
     rule_name: str,
     match,
-) -> None:
+) -> bool:
     rewrite_obj = INSTRUMENTABLE_RULES[
         rule_name
     ]
 
     if isinstance(match, tuple):
-        rewrite_obj.applier(
+        result = rewrite_obj.applier(
             g,
             match[0],
             match[1],
         )
     else:
-        rewrite_obj.applier(
+        result = rewrite_obj.applier(
             g,
             match,
         )
+
+    # Current PyZX appliers return bool.  Treat None as success for
+    # compatibility with older versions whose appliers mutated in place but
+    # did not return a value.
+    return result is not False
 
 
 def safe_apply_match(
@@ -328,16 +354,121 @@ def safe_apply_match(
     match,
 ) -> bool:
     try:
-        apply_match(
+        return apply_match(
             g,
             rule_name,
             match,
         )
 
-        return True
-
     except Exception:
         return False
+
+
+def _terminal_mu_with_greedy_continuation(
+    g,
+    forced_candidate=None,
+) -> tuple | None:
+    """Measure an extractable terminal outcome under a common continuation.
+
+    Intermediate graph-like ZX diagrams are frequently not circuit-like, so
+    trying to extract immediately after one primitive rewrite produces mostly
+    missing rewards.  A forced action followed by the deterministic greedy
+    policy gives every competing action the same, explicitly defined rollout.
+    """
+    from zx_cenf.quantale.strategies import (
+        finalize_for_extraction,
+        naive_greedy_reduce,
+    )
+
+    # PyZX Graph.copy() deliberately renumbers vertices.  A rewrite match
+    # contains vertex IDs, so it must be applied to an ID-preserving clone.
+    work = g.clone()
+    if forced_candidate is not None:
+        rule_name, match = forced_candidate
+        if not safe_apply_match(work, rule_name, match):
+            return None
+        work.remove_isolated_vertices()
+
+    naive_greedy_reduce(work)
+    if not finalize_for_extraction(work):
+        return None
+
+    try:
+        return mu_from_pyzx_graph(work).coords
+    except Exception:
+        return None
+
+
+def _counterfactual_crossroad_rows(
+    g,
+    candidates,
+    chosen,
+    context_hashes,
+    source_id: str | None = None,
+) -> list[RewriteLogRow]:
+    """Evaluate the application policy's chosen candidate for each rule."""
+    from functools import cmp_to_key
+
+    from zx_cenf.quantale.strategies import (
+        STEP_PRIORITY,
+        _lexicographic_better,
+        _one_step_surrogate_delta,
+    )
+
+    local_candidates = competing_candidates(candidates, chosen)
+    competing = tuple(sorted({rule for rule, _match in local_candidates}))
+    baseline_mu = _terminal_mu_with_greedy_continuation(g)
+    rows = []
+
+    for rule_name in competing:
+        scored_candidates = []
+        for candidate in local_candidates:
+            if candidate[0] != rule_name:
+                continue
+            delta = _one_step_surrogate_delta(g, *candidate)
+            if delta is not None:
+                scored_candidates.append((*candidate, delta))
+
+        scored_candidates.sort(
+            key=cmp_to_key(
+                lambda a, b: _lexicographic_better(
+                    a[2],
+                    b[2],
+                    priority=STEP_PRIORITY,
+                )
+            ),
+            reverse=True,
+        )
+        selected_candidate = (
+            scored_candidates[0][:2]
+            if scored_candidates
+            else None
+        )
+        terminal_mu = (
+            _terminal_mu_with_greedy_continuation(
+                g,
+                forced_candidate=selected_candidate,
+            )
+            if selected_candidate is not None
+            else None
+        )
+
+        rows.append(
+            RewriteLogRow(
+                pattern_hash=context_hashes[DEFAULT_CONTEXT_REPRESENTATION],
+                rule=rule_name,
+                was_crossroad=True,
+                competing_rules=competing,
+                mu_before=baseline_mu,
+                mu_after=terminal_mu,
+                mu_valid=baseline_mu is not None and terminal_mu is not None,
+                context_hash_variants=context_hashes,
+                selected_on_exploration_path=(rule_name == chosen[0]),
+                source_id=source_id,
+            )
+        )
+
+    return rows
 
 
 def run_instrumented_reduction(
@@ -346,6 +477,7 @@ def run_instrumented_reduction(
     max_steps: int = 200,
     compute_mu_per_step: bool = True,
     verbose: bool = False,
+    source_id: str | None = None,
 ) -> tuple:
     rng = random.Random(seed)
 
@@ -353,14 +485,22 @@ def run_instrumented_reduction(
 
     log_rows: list[RewriteLogRow] = []
 
-    reached_fixed_point = False
+    seen_states = set()
+    n_steps = 0
+    stop_reason = TrainingStopReason.HIT_STEP_CAP
 
     for _step in range(max_steps):
+        state_hash = compute_graph_state_hash(g)
+        if state_hash in seen_states:
+            stop_reason = TrainingStopReason.CYCLE_DETECTED
+            break
+        seen_states.add(state_hash)
+
         candidates = enumerate_all_candidates(g)
 
         if not candidates:
             if not simp.gadget_simp(g):
-                reached_fixed_point = True
+                stop_reason = TrainingStopReason.STRUCTURAL_FIXED_POINT
                 break
 
             continue
@@ -389,19 +529,14 @@ def run_instrumented_reduction(
                 chosen,
             )
 
-            pattern_hash = compute_local_pattern_hash(
+            context_hashes = compute_context_hash_variants(
                 g,
                 context_vertices,
             )
 
-            context_hashes = None
+            pattern_hash = context_hashes[DEFAULT_CONTEXT_REPRESENTATION]
 
             if was_crossroad:
-                context_hashes = compute_context_hash_variants(
-                    g,
-                    context_vertices,
-                )
-
                 if verbose:
                     print_crossroad_diagnostic(
                         g,
@@ -417,18 +552,16 @@ def run_instrumented_reduction(
                         context_hashes,
                     )
 
-            mu_before = None
-            mu_after = None
-            mu_valid = True
-
-            if compute_mu_per_step:
-                try:
-                    mu_before = mu_from_pyzx_graph(
-                        g
-                    ).coords
-
-                except Exception:
-                    mu_valid = False
+            if was_crossroad and compute_mu_per_step:
+                crossroad_rows = _counterfactual_crossroad_rows(
+                    g,
+                    candidates,
+                    chosen,
+                    context_hashes,
+                    source_id=source_id,
+                )
+            else:
+                crossroad_rows = []
 
             applied_ok = safe_apply_match(
                 g,
@@ -437,33 +570,30 @@ def run_instrumented_reduction(
             )
 
         if not applied_ok:
+            stop_reason = TrainingStopReason.ALL_CANDIDATES_FAILED
             break
 
         g.remove_isolated_vertices()
+        n_steps += 1
 
-        if compute_mu_per_step and mu_valid:
-            try:
-                mu_after = mu_from_pyzx_graph(
-                    g
-                ).coords
-
-            except Exception:
-                mu_valid = False
-
-        log_rows.append(
-            RewriteLogRow(
-                pattern_hash=pattern_hash,
-                rule=rule_name,
-                was_crossroad=was_crossroad,
-                competing_rules=competing,
-                mu_before=mu_before,
-                mu_after=mu_after,
-                mu_valid=mu_valid,
-                context_hash_variants=context_hashes,
+        if crossroad_rows:
+            log_rows.extend(crossroad_rows)
+        else:
+            log_rows.append(
+                RewriteLogRow(
+                    pattern_hash=pattern_hash,
+                    rule=rule_name,
+                    was_crossroad=was_crossroad,
+                    competing_rules=competing,
+                    mu_before=None,
+                    mu_after=None,
+                    mu_valid=False,
+                    context_hash_variants=context_hashes,
+                    source_id=source_id,
+                )
             )
-        )
 
     return (
         log_rows,
-        reached_fixed_point,
+        TrainingOutcome(stop_reason, n_steps),
     )

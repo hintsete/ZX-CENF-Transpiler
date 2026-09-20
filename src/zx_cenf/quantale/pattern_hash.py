@@ -17,6 +17,17 @@ DEFAULT_INCLUDE_DEGREE = True
 DEFAULT_INCLUDE_PHASE = True
 
 
+def make_context_key(pattern_hash: str, competing_rules) -> tuple[str, tuple[str, ...]]:
+    """Key a structural pattern together with its available action set.
+
+    A structural neighbourhood alone is not a complete decision context: the
+    same neighbourhood may expose different rewrite rules after matcher or
+    phase changes.  Keeping the rule signature in the key prevents a learned
+    preference from being transferred to a different choice set.
+    """
+    return pattern_hash, tuple(sorted(set(competing_rules)))
+
+
 def is_valid_pattern(pattern_hash: str) -> bool:
     return bool(pattern_hash) and pattern_hash != ERROR_PATTERN
 
@@ -61,7 +72,14 @@ def _pyzx_graph_to_labelled_networkx(g) -> nx.Graph:
     return G
 
 
-def _build_node_label(ego, node, center_set, include_degree, include_phase, original_graph) -> str:
+def _build_node_label(
+    ego,
+    node,
+    center_set,
+    include_degree,
+    include_phase,
+    original_graph,
+) -> str:
     data = ego.nodes[node]
     marker = "C" if node in center_set else "n"
     vtype = data.get("vtype", "?")
@@ -106,9 +124,26 @@ def compute_local_pattern_hash(
             for node in ego.nodes()
         }
         nx.set_node_attributes(ego, labels, name="label")
-        return nx.weisfeiler_lehman_graph_hash(ego, node_attr="label", edge_attr="etype", iterations=iterations)
+        return nx.weisfeiler_lehman_graph_hash(
+            ego,
+            node_attr="label",
+            edge_attr="etype",
+            iterations=iterations,
+        )
     except Exception:
         logging.getLogger(__name__).warning(
             "pattern hash computation failed for vertices=%r", center_vertices, exc_info=True
         )
         return ERROR_PATTERN
+
+
+def compute_graph_state_hash(g, iterations: int = 3) -> str:
+    """Return an ID-independent fingerprint used only for cycle detection."""
+    return compute_local_pattern_hash(
+        g,
+        list(g.vertices()),
+        radius=0,
+        iterations=iterations,
+        include_degree=True,
+        include_phase=True,
+    )

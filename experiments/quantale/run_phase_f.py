@@ -6,6 +6,7 @@ import pyzx as zx
 
 from zx_cenf.quantale.evaluation import evaluate_on_held_out_diagram
 from zx_cenf.quantale.instrumented_reduction import (
+    DEFAULT_CONTEXT_REPRESENTATION,
     run_instrumented_reduction,
 )
 from zx_cenf.quantale.pattern_table import (
@@ -23,6 +24,7 @@ DIAGRAM_NAMES = [
 ]
 
 N_TRAINING_SWEEPS_PER_DIAGRAM = 5
+MIN_OCCURRENCES_PER_RULE = 5
 
 
 def train_pattern_table(train_names):
@@ -38,22 +40,23 @@ def train_pattern_table(train_names):
         ):
             g = circuit.to_graph()
 
-            log_rows, reached = run_instrumented_reduction(
+            log_rows, outcome = run_instrumented_reduction(
                 g,
                 seed=sweep_seed,
             )
 
             print(
                 f"    [{name}] sweep {sweep_seed}: "
-                f"{len(log_rows)} steps, "
-                f"fixed_point={reached}"
+                f"{outcome.n_steps} applied rewrites, "
+                f"{len(log_rows)} logged action observations, "
+                f"stop={outcome.stop_reason.value}"
             )
 
             all_log_rows.extend(log_rows)
 
     table, diagnostics = build_pattern_rule_table(
         all_log_rows,
-        min_occurrences=5,
+        min_occurrences=MIN_OCCURRENCES_PER_RULE,
     )
 
     return (
@@ -64,6 +67,13 @@ def train_pattern_table(train_names):
 
 
 def main():
+    print(
+        "Phase F configuration: "
+        f"context={DEFAULT_CONTEXT_REPRESENTATION}, "
+        "reward=terminal μ delta after forced rule + greedy continuation, "
+        "priority=(two-qubit count, depth, T-count)"
+    )
+
     for held_out in DIAGRAM_NAMES:
         train_names = [
             name
@@ -82,7 +92,7 @@ def main():
             train_pattern_table(train_names)
         )
 
-        n_crossroad = sum(
+        n_crossroad_observations = sum(
             1
             for row in all_log_rows
             if row.was_crossroad
@@ -91,21 +101,19 @@ def main():
         n_valid = sum(
             1
             for row in all_log_rows
-            if row.mu_valid
+            if row.was_crossroad and row.mu_valid
         )
 
-        pct_crossroad = (
-            100 * n_crossroad / len(all_log_rows)
-            if all_log_rows
+        pct_valid = (
+            100 * n_valid / n_crossroad_observations
+            if n_crossroad_observations
             else 0.0
         )
 
         print(
-            f"  Logged {len(all_log_rows)} applications | "
-            f"LOCAL crossroads: "
-            f"{n_crossroad} "
-            f"({pct_crossroad:.1f}%) | "
-            f"mu_valid: {n_valid}"
+            f"  Logged {n_crossroad_observations} counterfactual "
+            f"crossroad action observations | terminal μ valid: "
+            f"{n_valid} ({pct_valid:.1f}%)"
         )
 
         print(
@@ -113,8 +121,8 @@ def main():
             f"{diagnostics['n_patterns_pooled']} | "
             f"enough data: "
             f"{diagnostics['n_patterns_with_enough_data']} | "
-            f"one-sided (NOT learned): "
-            f"{diagnostics['n_patterns_one_sided']} | "
+            f"incomplete action support: "
+            f"{diagnostics['n_patterns_incomplete']} | "
             f"ties: "
             f"{diagnostics['n_patterns_dropped_as_tie']}"
         )
@@ -138,7 +146,8 @@ def main():
 
         overlap = pattern_overlap_report(
             all_log_rows,
-            result.test_pattern_hashes,
+            result.test_context_keys,
+            learned_table=table,
         )
 
         print(
@@ -148,20 +157,20 @@ def main():
         print(
             "  unique train hashes: "
             f"{overlap['n_unique_train_hashes']} "
-            "(crossroad-only: "
-            f"{overlap['n_unique_train_crossroad_hashes']})"
+            f"({overlap['n_unique_train_contexts']} decision contexts)"
         )
 
         print(
             "  unique test hashes:  "
-            f"{overlap['n_unique_test_hashes']}"
+            f"{overlap['n_unique_test_hashes']} "
+            f"({overlap['n_unique_test_contexts']} decision contexts)"
         )
 
         print(
-            "  OVERLAP: "
-            f"{overlap['n_overlap_all']} "
-            "(crossroad-only: "
-            f"{overlap['n_overlap_crossroad']})"
+            "  structural/context/learned overlap: "
+            f"{overlap['n_structural_overlap']}/"
+            f"{overlap['n_decision_context_overlap']}/"
+            f"{overlap['n_learned_context_overlap']}"
         )
 
         total_crossroad_lookups = (
@@ -181,7 +190,7 @@ def main():
         )
 
         print(
-            f"  oracle:           "
+            f"  empirical oracle: "
             f"{result.oracle_mu}"
         )
 
@@ -209,10 +218,16 @@ def main():
             f"{hit_rate:.1%}"
         )
 
+        if not table:
+            print(
+                "  coverage interpretation: no supported non-tied "
+                "preference was learned, so no table action was available"
+            )
+
         print(
             "  learned choices differing "
             "from greedy: "
-            f"{sum(1 for row in [])}"
+            f"{result.table_n_differs_from_greedy}"
         )
 
 

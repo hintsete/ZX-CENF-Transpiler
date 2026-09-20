@@ -52,12 +52,18 @@ def main() -> None:
         print(f"  learned table: {len(learned_table)} entries | "
               f"null table: {len(null_table)} entries (same keys: "
               f"{set(learned_table.keys()) == set(null_table.keys())})")
+        print(
+            "  supported contexts: "
+            f"{diagnostics['n_patterns_with_enough_data']} | "
+            "ties: "
+            f"{diagnostics['n_patterns_dropped_as_tie']}"
+        )
 
         circuit = zx.Circuit.load(str(DATA_DIR / f"{held_out}.qasm"))
         g = circuit.to_graph()
         result = evaluate_ablation(g, held_out, learned_table, null_table, null_seed=NULL_TABLE_SEED)
 
-        print(f"\n  oracle:       {_fmt(result.oracle_mu)}")
+        print(f"\n  empirical oracle (30): {_fmt(result.oracle_mu)}")
         print(f"  greedy:       {_fmt(result.greedy_mu)}  [{result.greedy_stop}]")
         print(f"  learned:      {_fmt(result.learned_mu)}  [{result.learned_stop}]  "
               f"hits={result.learned_hits} differs_from_greedy={result.learned_n_differs_from_greedy}")
@@ -67,7 +73,12 @@ def main() -> None:
 
         # --- interpretation logic, per the ablation spec ---
         min_hits_for_comparison = 3
-        if result.learned_hits < min_hits_for_comparison and result.null_hits < min_hits_for_comparison:
+        if not learned_table:
+            verdict = (
+                "INCONCLUSIVE -- no supported non-tied preference was learned; "
+                "there is no policy to ablate"
+            )
+        elif result.learned_hits < min_hits_for_comparison and result.null_hits < min_hits_for_comparison:
             verdict = "INCONCLUSIVE -- too few table hits for either table to compare meaningfully"
         elif result.learned_mu is None or result.null_mu is None:
             verdict = "INCONCLUSIVE -- one or both strategies failed to finalize to an extractable state"

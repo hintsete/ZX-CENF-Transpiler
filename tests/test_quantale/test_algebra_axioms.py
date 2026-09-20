@@ -336,3 +336,7 @@ def test_big_join_empty_raises():
     
     with pytest.raises(ValueError):
         big_join([])
+
+
+def test_typed_empty_big_join_is_lattice_bottom():
+    assert big_join([], dim=3) == unit(3)

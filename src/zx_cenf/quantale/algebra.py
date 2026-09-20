@@ -74,12 +74,20 @@ def top(dim: int) -> QuantaleValue:
     return QuantaleValue(tuple(float("inf") for _ in range(dim)))
 
 
-def big_join(values: list[QuantaleValue]) -> QuantaleValue:
-    """Join all values using componentwise maximum."""
+def big_join(
+    values: list[QuantaleValue],
+    dim: int | None = None,
+) -> QuantaleValue:
+    """Join values, using the lattice bottom for a typed empty family.
+
+    ``dim`` is only needed when ``values`` is empty because the coordinate
+    dimension cannot otherwise be inferred.  Calling an untyped empty join
+    still raises rather than silently inventing a dimension.
+    """
     if not values:
-        raise ValueError(
-            "big_join of an empty list is undefined — caller must handle this case"
-        )
+        if dim is None:
+            raise ValueError("dim is required for an empty big_join")
+        return unit(dim)
 
     result = values[0]
     for value in values[1:]:

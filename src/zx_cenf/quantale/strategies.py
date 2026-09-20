@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import cmp_to_key
 
 import pyzx.simplify as simp
 
 from zx_cenf.quantale.instrumented_reduction import (
+    DEFAULT_CONTEXT_REPRESENTATION,
+    competing_candidates,
+    compute_context_hash_variants,
     decision_context_vertices,
     enumerate_all_candidates,
     local_competing_rules,
@@ -16,8 +19,9 @@ from zx_cenf.quantale.instrumented_reduction import (
     safe_apply_match,
 )
 from zx_cenf.quantale.pattern_hash import (
-    compute_local_pattern_hash,
+    compute_graph_state_hash,
     is_valid_pattern,
+    make_context_key,
 )
 from zx_cenf.quantale.surrogate import SURROGATE_PRIORITY, surrogate_value
 
@@ -43,6 +47,7 @@ class StopReason(str, Enum):
     NO_IMPROVING_MOVE = "no_improving_move"
     HIT_STEP_CAP = "hit_step_cap"
     ALL_CANDIDATES_FAILED = "all_candidates_failed"
+    CYCLE_DETECTED = "cycle_detected"
 
 
 @dataclass
@@ -51,9 +56,14 @@ class ReductionOutcome:
     n_steps: int
     n_table_hits: int
     n_table_misses: int
+    lookup_diagnostics: dict = field(default_factory=dict)
 
     @property
     def reached_fixed_point(self) -> bool:
+        return self.stop_reason == StopReason.STRUCTURAL_FIXED_POINT
+
+    @property
+    def reached_policy_fixed_point(self) -> bool:
         return self.stop_reason in (
             StopReason.STRUCTURAL_FIXED_POINT,
             StopReason.NO_IMPROVING_MOVE,
@@ -123,7 +133,9 @@ def _one_step_surrogate_delta(
     """
     before = surrogate_value(g).coords
 
-    g_copy = g.copy()
+    # PyZX Graph.copy() renumbers vertices; rewrite matches refer to the
+    # original IDs and therefore require an ID-preserving clone.
+    g_copy = g.clone()
 
     if not safe_apply_match(
         g_copy,
@@ -323,7 +335,17 @@ def _find_table_preference(
     actual held-out lookup path.
     """
 
-    for candidate in ranked:
+    # A learned policy is specifically meant to escape choices that look
+    # unattractive to the one-step surrogate.  Search greedy-ranked candidates
+    # first, but do not make surrogate improvement a prerequisite for lookup.
+    search_order = list(ranked)
+    search_order.extend(
+        candidate
+        for candidate in candidates
+        if candidate not in search_order
+    )
+
+    for candidate in search_order:
         rule_name, match = candidate
 
         competing_rules = local_competing_rules(
@@ -344,10 +366,8 @@ def _find_table_preference(
             candidate,
         )
 
-        pattern_hash = compute_local_pattern_hash(
-            g,
-            context_vertices,
-        )
+        context_hashes = compute_context_hash_variants(g, context_vertices)
+        pattern_hash = context_hashes[DEFAULT_CONTEXT_REPRESENTATION]
 
         if not is_valid_pattern(pattern_hash):
             if diagnostics is not None:
@@ -359,7 +379,12 @@ def _find_table_preference(
             diagnostics["valid_crossroad_hashes"] += 1
             diagnostics["observed_hashes"].add(pattern_hash)
 
-        preferred_rule = pattern_table.get(pattern_hash)
+        context_key = make_context_key(pattern_hash, competing_rules)
+
+        if diagnostics is not None:
+            diagnostics["observed_context_keys"].add(context_key)
+
+        preferred_rule = pattern_table.get(context_key)
 
         # CASE B:
         # The test pattern is structurally represented, but there is no
@@ -372,7 +397,7 @@ def _find_table_preference(
 
         if diagnostics is not None:
             diagnostics["hash_in_table"] += 1
-            diagnostics["table_matches"].add(pattern_hash)
+            diagnostics["table_matches"].add(context_key)
 
         # CASE C:
         # A learned pattern exists, but the rule learned for it is not
@@ -390,18 +415,16 @@ def _find_table_preference(
 
             continue
 
-        preferred_candidate = next(
-            (
-                c
-                for c in ranked
-                if c[0] == preferred_rule
-            ),
-            None,
-        )
+        local_candidates = competing_candidates(candidates, candidate)
+        preferred_options = []
+        for local_candidate in local_candidates:
+            if local_candidate[0] != preferred_rule:
+                continue
+            delta = _one_step_surrogate_delta(g, *local_candidate)
+            if delta is not None:
+                preferred_options.append((*local_candidate, delta))
 
-        # The rule is conceptually competing but was filtered out because
-        # it is not a surrogate-improving candidate.
-        if preferred_candidate is None:
+        if not preferred_options:
             if diagnostics is not None:
                 diagnostics["preferred_rule_not_ranked"] += 1
                 diagnostics["inapplicable_preferences"].append(
@@ -413,6 +436,18 @@ def _find_table_preference(
                 )
 
             continue
+
+        preferred_options.sort(
+            key=cmp_to_key(
+                lambda a, b: _lexicographic_better(
+                    a[2],
+                    b[2],
+                    priority=STEP_PRIORITY,
+                )
+            ),
+            reverse=True,
+        )
+        preferred_candidate = preferred_options[0][:2]
 
         # CASE D:
         # Actual learned preference is applicable.
@@ -428,6 +463,7 @@ def _find_table_preference(
 
         return {
             "pattern_hash": pattern_hash,
+            "context_key": context_key,
             "preferred_rule": preferred_rule,
             "preferred_candidate": preferred_candidate,
             "competing_rules": competing_rules,
@@ -437,12 +473,7 @@ def _find_table_preference(
 
 
 def _new_lookup_diagnostics() -> dict:
-    """
-    Counters for the ACTUAL table-guided held-out trajectory.
-
-    These are deliberately kept outside ReductionOutcome so existing
-    callers and result serialization do not need to change.
-    """
+    """Counters for the actual table-guided held-out trajectory."""
     return {
         "candidate_crossroad_checks": 0,
         "valid_crossroad_hashes": 0,
@@ -453,6 +484,7 @@ def _new_lookup_diagnostics() -> dict:
         "preferred_rule_not_ranked": 0,
         "applicable_preferences": 0,
         "observed_hashes": set(),
+        "observed_context_keys": set(),
         "table_matches": set(),
         "inapplicable_preferences": [],
         "applicable_hits": [],
@@ -486,17 +518,22 @@ def _print_lookup_diagnostics(
     )
 
     print(
-        "  hashes present in table:    "
+        "  unique decision contexts:   "
+        f"{len(diagnostics['observed_context_keys'])}"
+    )
+
+    print(
+        "  context checks in table:    "
         f"{diagnostics['hash_in_table']}"
     )
 
     print(
-        "  unique table hashes hit:    "
+        "  unique table contexts hit:  "
         f"{len(diagnostics['table_matches'])}"
     )
 
     print(
-        "  hash absent from table:     "
+        "  context absent from table:  "
         f"{diagnostics['hash_not_in_table']}"
     )
 
@@ -558,40 +595,38 @@ def table_guided_reduce(
     max_steps: int = 200,
     diagnostic: bool = False,
 ) -> tuple:
-    
     simp.to_gh(g)
 
     n_steps = 0
     n_table_hits = 0
     n_table_misses = 0
-
     trace: list = []
+    diagnostics = _new_lookup_diagnostics()
+    seen_states = set()
 
-    diagnostics = (
-        _new_lookup_diagnostics()
-        if diagnostic
-        else None
-    )
+    def finish(stop_reason):
+        outcome = ReductionOutcome(
+            stop_reason,
+            n_steps,
+            n_table_hits,
+            n_table_misses,
+            lookup_diagnostics=diagnostics,
+        )
+        if diagnostic:
+            _print_lookup_diagnostics(diagnostics)
+        return outcome, trace
 
     for _step in range(max_steps):
+        state_hash = compute_graph_state_hash(g)
+        if state_hash in seen_states:
+            return finish(StopReason.CYCLE_DETECTED)
+        seen_states.add(state_hash)
+
         candidates = enumerate_all_candidates(g)
 
         if not candidates:
             if not simp.gadget_simp(g):
-                outcome = ReductionOutcome(
-                    StopReason.STRUCTURAL_FIXED_POINT,
-                    n_steps,
-                    n_table_hits,
-                    n_table_misses,
-                )
-
-                if diagnostics is not None:
-                    _print_lookup_diagnostics(diagnostics)
-
-                return (
-                    outcome,
-                    trace,
-                )
+                return finish(StopReason.STRUCTURAL_FIXED_POINT)
 
             continue
 
@@ -600,23 +635,11 @@ def table_guided_reduce(
             candidates,
         )
 
-        if not ranked:
-            outcome = ReductionOutcome(
-                StopReason.NO_IMPROVING_MOVE,
-                n_steps,
-                n_table_hits,
-                n_table_misses,
-            )
-
-            if diagnostics is not None:
-                _print_lookup_diagnostics(diagnostics)
-
-            return (
-                outcome,
-                trace,
-            )
-
-        greedy_choice_rule = ranked[0][0]
+        greedy_choice_rule = ranked[0][0] if ranked else None
+        has_crossroad = any(
+            len(local_competing_rules(candidates, candidate)) > 1
+            for candidate in candidates
+        )
 
         lookup = _find_table_preference(
             g,
@@ -627,32 +650,8 @@ def table_guided_reduce(
         )
 
         if lookup is not None:
-            n_table_hits += 1
-
-            pattern_hash = lookup["pattern_hash"]
-            preferred_rule = lookup["preferred_rule"]
             preferred_candidate = lookup["preferred_candidate"]
-            competing_rules = lookup["competing_rules"]
-
-            rule_name, match = preferred_candidate
-
             surrogate_before = surrogate_value(g).coords
-
-            trace.append(
-                TableHitRecord(
-                    step=_step,
-                    pattern_hash=pattern_hash,
-                    preferred_rule=preferred_rule,
-                    competing_rules=competing_rules,
-                    rule_selected=rule_name,
-                    surrogate_before=surrogate_before,
-                    surrogate_after=None,
-                    differs_from_greedy_choice=(
-                        rule_name != greedy_choice_rule
-                    ),
-                )
-            )
-
             ordered = [
                 preferred_candidate
             ] + [
@@ -662,21 +661,10 @@ def table_guided_reduce(
             ]
 
         else:
-            # A local crossroad exists if at least one ranked candidate
-            # has another rule overlapping its redex.
-            has_crossroad = any(
-                len(
-                    local_competing_rules(
-                        candidates,
-                        candidate,
-                    )
-                ) > 1
-                for candidate in ranked
-            )
-
             if has_crossroad:
                 n_table_misses += 1
-
+            if not ranked:
+                return finish(StopReason.NO_IMPROVING_MOVE)
             ordered = ranked
 
         applied = _apply_ranked_inplace(
@@ -685,51 +673,29 @@ def table_guided_reduce(
         )
 
         if applied is None:
-            if lookup is not None:
-                trace.pop()
-
-            outcome = ReductionOutcome(
-                StopReason.ALL_CANDIDATES_FAILED,
-                n_steps,
-                n_table_hits,
-                n_table_misses,
-            )
-
-            if diagnostics is not None:
-                _print_lookup_diagnostics(diagnostics)
-
-            return (
-                outcome,
-                trace,
-            )
+            return finish(StopReason.ALL_CANDIDATES_FAILED)
 
         n_steps += 1
 
-        if lookup is not None:
+        if lookup is not None and applied == lookup["preferred_candidate"]:
+            n_table_hits += 1
             applied_rule, _match = applied
-
-            if applied_rule != lookup["preferred_rule"]:
-                trace[-1].rule_selected = applied_rule
-
-                trace[-1].differs_from_greedy_choice = (
-                    applied_rule != greedy_choice_rule
+            trace.append(
+                TableHitRecord(
+                    step=_step,
+                    pattern_hash=lookup["pattern_hash"],
+                    preferred_rule=lookup["preferred_rule"],
+                    competing_rules=lookup["competing_rules"],
+                    rule_selected=applied_rule,
+                    surrogate_before=surrogate_before,
+                    surrogate_after=surrogate_value(g).coords,
+                    differs_from_greedy_choice=(
+                        greedy_choice_rule is None
+                        or applied_rule != greedy_choice_rule
+                    ),
                 )
-
-            trace[-1].surrogate_after = (
-                surrogate_value(g).coords
             )
+        elif lookup is not None and has_crossroad:
+            n_table_misses += 1
 
-    outcome = ReductionOutcome(
-        StopReason.HIT_STEP_CAP,
-        n_steps,
-        n_table_hits,
-        n_table_misses,
-    )
-
-    if diagnostics is not None:
-        _print_lookup_diagnostics(diagnostics)
-
-    return (
-        outcome,
-        trace,
-    )
+    return finish(StopReason.HIT_STEP_CAP)

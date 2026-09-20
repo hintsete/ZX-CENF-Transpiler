@@ -6,11 +6,6 @@ from dataclasses import dataclass, field
 from functools import cmp_to_key
 
 from zx_cenf.ambiguity.pyzx_ordering import run_randomized_pass_order, run_full_reduce_baseline
-from zx_cenf.quantale.instrumented_reduction import (
-    enumerate_all_candidates,
-    local_competing_rules,
-)
-from zx_cenf.quantale.pattern_hash import compute_local_pattern_hash, is_valid_pattern
 from zx_cenf.quantale.strategies import (
     PRIORITY,
     finalize_for_extraction,
@@ -32,7 +27,9 @@ class EvaluationResult:
     table_misses: int
     full_reduce_mu: tuple | None
     test_pattern_hashes: list = field(default_factory=list)
-    test_pattern_hash_variants: dict = field(default_factory=dict)
+    test_context_keys: list = field(default_factory=list)
+    table_n_differs_from_greedy: int = 0
+    table_trace: list = field(default_factory=list)
 
 
 @dataclass
@@ -55,6 +52,8 @@ class AblationResult:
     null_trace: list = field(default_factory=list)
     full_reduce_mu: tuple | None = None
     null_seed: int = 0
+    learned_lookup_diagnostics: dict = field(default_factory=dict)
+    null_lookup_diagnostics: dict = field(default_factory=dict)
 
 
 def _safe_mu(g):
@@ -87,69 +86,12 @@ def compute_empirical_oracle(g_original, n_orderings: int = 30, base_seed: int =
     return results[0]
 
 
-def collect_test_pattern_hash_variants(g_original, max_steps: int = 200) -> dict:
-    """Collect the four representation hashes actually encountered by
-    the held-out diagram during a deterministic greedy-style reduction,
-    using the SAME shared-anchor decision-context definition as
-    training (not candidate-centered hashing)."""
-    import pyzx.simplify as simp
-    from zx_cenf.quantale.instrumented_reduction import (
-        safe_apply_match,
-        apply_match,
-        decision_context_vertices,
-        compute_context_hash_variants,
-    )
-
-    g = g_original.copy()
-    simp.to_gh(g)
-    hashes = {"FULL": set(), "NO_DEGREE": set(), "NO_PHASE": set(), "STRUCTURAL": set()}
-
-    for _step in range(max_steps):
-        candidates = enumerate_all_candidates(g)
-        if not candidates:
-            if not simp.gadget_simp(g):
-                break
-            continue
-
-        chosen = None
-        for candidate in candidates:
-            rule_name, match = candidate
-            test_graph = g.copy()
-            try:
-                apply_match(test_graph, rule_name, match)
-                chosen = candidate
-                break
-            except Exception:
-                continue
-        if chosen is None:
-            break
-
-        competing = local_competing_rules(candidates, chosen)
-        if len(competing) > 1:
-            context_vertices = decision_context_vertices(g, candidates, chosen)
-            context_hashes = compute_context_hash_variants(g, context_vertices)
-            for representation, pattern_hash in context_hashes.items():
-                if pattern_hash and pattern_hash != "ERROR":
-                    hashes[representation].add(pattern_hash)
-
-        rule_name, match = chosen
-        if not safe_apply_match(g, rule_name, match):
-            break
-        g.remove_isolated_vertices()
-
-    return hashes
-
-
-def collect_test_pattern_hashes(g_original, max_steps: int = 200) -> list:
-    variants = collect_test_pattern_hash_variants(g_original, max_steps=max_steps)
-    return sorted(variants["FULL"])
-
-
 def evaluate_on_held_out_diagram(
     g_original,
     diagram_id: str,
     pattern_table: dict,
     n_oracle_orderings: int = 30,
+    diagnostic: bool = True,
 ) -> EvaluationResult:
     oracle_mu = compute_empirical_oracle(g_original, n_oracle_orderings)
 
@@ -159,12 +101,11 @@ def evaluate_on_held_out_diagram(
     greedy_mu = _safe_mu(g_greedy)
 
     g_table = g_original.copy()
-    # table_outcome, _trace = table_guided_reduce(g_table, pattern_table, )
-    table_outcome, _trace = table_guided_reduce(
-    g_table,
-    pattern_table,
-    diagnostic=True,
-)
+    table_outcome, table_trace = table_guided_reduce(
+        g_table,
+        pattern_table,
+        diagnostic=diagnostic,
+    )
     finalize_for_extraction(g_table)
     table_mu = _safe_mu(g_table)
 
@@ -172,7 +113,9 @@ def evaluate_on_held_out_diagram(
     run_full_reduce_baseline(g_full)
     full_reduce_mu = _safe_mu(g_full)
 
-    test_pattern_hash_variants = collect_test_pattern_hash_variants(g_original)
+    lookup_diagnostics = table_outcome.lookup_diagnostics
+    test_pattern_hashes = sorted(lookup_diagnostics["observed_hashes"])
+    test_context_keys = sorted(lookup_diagnostics["observed_context_keys"])
 
     return EvaluationResult(
         diagram_id=diagram_id,
@@ -184,8 +127,12 @@ def evaluate_on_held_out_diagram(
         table_hits=table_outcome.n_table_hits,
         table_misses=table_outcome.n_table_misses,
         full_reduce_mu=full_reduce_mu,
-        test_pattern_hashes=sorted(test_pattern_hash_variants["FULL"]),
-        test_pattern_hash_variants=test_pattern_hash_variants,
+        test_pattern_hashes=test_pattern_hashes,
+        test_context_keys=test_context_keys,
+        table_n_differs_from_greedy=sum(
+            1 for row in table_trace if row.differs_from_greedy_choice
+        ),
+        table_trace=table_trace,
     )
 
 
@@ -196,6 +143,7 @@ def evaluate_ablation(
     null_table: dict,
     null_seed: int,
     n_oracle_orderings: int = 30,
+    diagnostic: bool = True,
 ) -> AblationResult:
     oracle_mu = compute_empirical_oracle(g_original, n_oracle_orderings)
 
@@ -205,12 +153,11 @@ def evaluate_ablation(
     greedy_mu = _safe_mu(g_greedy)
 
     g_learned = g_original.copy()
-    # learned_outcome, learned_trace = table_guided_reduce(g_learned, learned_table)
     learned_outcome, learned_trace = table_guided_reduce(
-    g_learned,
-    learned_table,
-    diagnostic=True,
-)
+        g_learned,
+        learned_table,
+        diagnostic=diagnostic,
+    )
     finalize_for_extraction(g_learned)
     learned_mu = _safe_mu(g_learned)
 
@@ -242,4 +189,6 @@ def evaluate_ablation(
         null_trace=null_trace,
         full_reduce_mu=full_reduce_mu,
         null_seed=null_seed,
+        learned_lookup_diagnostics=learned_outcome.lookup_diagnostics,
+        null_lookup_diagnostics=null_outcome.lookup_diagnostics,
     )
