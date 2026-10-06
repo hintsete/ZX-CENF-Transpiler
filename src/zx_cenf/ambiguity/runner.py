@@ -4,6 +4,7 @@ written to a single CSV"""
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +28,9 @@ def run_track1(
     evolutionary_features_csv: Path | None = None,
     run_neighborhoods_csv: Path | None = None,
     pareto_summary_csv: Path | None = None,
+    run_results_csv: Path | None = None,
+    base_seed: int = 0,
 ) -> None:
-
-    base_seed = 0
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     if spider_tags_csv is not None:
@@ -40,6 +41,7 @@ def run_track1(
     all_evo_features: list = []
     all_nbhd_records: list = []
     all_pareto_rows: list = []
+    all_run_rows: list[dict] = []
 
     for path in tqdm(qasm_paths, desc="Track 1: ambiguity scoring"):
         diagram_id = path.stem
@@ -91,16 +93,44 @@ def run_track1(
 
         n_ambiguous = sum(1 for t in spider_tags if t.is_ambiguous)
 
+        metric_summaries = {
+            metric: result.metric_summary(metric)
+            for metric in ("twoqubitcount", "tcount", "depth")
+        }
+        successful_valuations = {
+            (run.twoqubitcount, run.tcount, run.depth)
+            for run in result.successful_runs
+        }
+        for run in result.runs:
+            all_run_rows.append(
+                {
+                    "diagram_id": diagram_id,
+                    "seed": run.seed,
+                    "extraction_failed": run.extraction_failed,
+                    "twoqubitcount": run.twoqubitcount,
+                    "tcount": run.tcount,
+                    "depth": run.depth,
+                    "final_spiders": run.spider_count,
+                    "final_edges": run.edge_count,
+                    "pass_counts": json.dumps(run.pass_counts, sort_keys=True),
+                }
+            )
+
         row = {
             "diagram_id": diagram_id,
             "input_spiders": g.num_vertices(),
             "input_edges": g.num_edges(),
             "n_orderings": n_orderings,
             "n_successful_extractions": len(result.successful_runs),
+            "n_distinct_terminal_valuations": len(successful_valuations),
             "twoqubitcount_ambiguity_score": result.ambiguity_score("twoqubitcount"),
             "twoqubitcount_is_ambiguous": result.is_ambiguous("twoqubitcount"),
             "tcount_ambiguity_score": result.ambiguity_score("tcount"),
             "depth_ambiguity_score": result.ambiguity_score("depth"),
+            "any_metric_is_ambiguous": any(
+                summary is not None and summary["min"] != summary["max"]
+                for summary in metric_summaries.values()
+            ),
             "full_reduce_twoqubitcount": result.full_reduce_baseline.twoqubitcount,
             "full_reduce_tcount": result.full_reduce_baseline.tcount,
             "full_reduce_depth": result.full_reduce_baseline.depth,
@@ -109,6 +139,10 @@ def run_track1(
             "n_ambiguous_spiders": n_ambiguous,
             "pct_ambiguous_spiders": round(100 * n_ambiguous / g.num_vertices(), 1) if g.num_vertices() else 0.0,
         }
+        for metric, summary in metric_summaries.items():
+            row[f"{metric}_min"] = summary["min"] if summary else None
+            row[f"{metric}_max"] = summary["max"] if summary else None
+            row[f"{metric}_mean"] = summary["mean"] if summary else None
         row.update(control)
         rows.append(row)
 
@@ -147,3 +181,10 @@ def run_track1(
             writer.writeheader()  # always write header even if no records
             for rec in all_nbhd_records:
                 writer.writerow(vars(rec))
+
+    if run_results_csv is not None and all_run_rows:
+        run_results_csv.parent.mkdir(parents=True, exist_ok=True)
+        with run_results_csv.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=all_run_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(all_run_rows)

@@ -2,3 +2,6 @@ pyzx==0.10.4
 networkx
 numpy
 tqdm
+pandas
+scipy>=1.11.0
+scikit-learn>=1.4.0
